@@ -118,6 +118,20 @@ struct App {
 
     std::string messageBoxText;
     std::string settingsFile;
+
+    bool finishedLoading = false;
+
+    struct Automation {
+        AutomationList* batchTest = nullptr;
+        float sleepDuration = 0.2f;
+        bool exportScreenshots = true;
+        bool exportSettings = true;
+        size_t activeIndex;
+        bool isActive = false;
+        float elapsedTime;
+        bool autoclose = false;
+        bool autostart = false;
+    } automation;
 };
 
 static const char* DEFAULT_IBL = "default_env";
@@ -133,6 +147,8 @@ static void printUsage(char* name) {
         "       Prints this message\n\n"
         "   --api, -a\n"
         "       Specify the backend API: opengl (default), vulkan, or metal\n\n"
+        "   --batch=<path to JSON file>, -b\n"
+        "       Start automation using the given JSON spec, then quit the app\n\n"
         "   --ibl=<path to cmgen IBL>, -i <path>\n"
         "       Override the built-in IBL\n\n"
         "   --actual-size, -s\n"
@@ -140,7 +156,7 @@ static void printUsage(char* name) {
         "   --recompute-aabb, -r\n"
         "       Ignore the min/max attributes in the glTF file\n\n"
         "   --settings=<path to JSON file>, -t\n"
-        "       Apply the settings in the given JSON file.\n\n"
+        "       Apply the settings in the given JSON file\n\n"
         "   --ubershader, -u\n"
         "       Enable ubershaders (improves load time, adds shader complexity)\n\n"
         "   --camera=<camera mode>, -c <camera mode>\n"
@@ -159,11 +175,27 @@ static void printUsage(char* name) {
     std::cout << usage;
 }
 
+static void startBatchTest(App* app) {
+    app->automation.activeIndex = 0;
+    app->automation.isActive = true;
+    app->automation.elapsedTime = 0;
+
+    Settings settings;
+    app->automation.batchTest->get(0, &settings);
+    app->viewer->getViewSettings() = settings.view;
+}
+
+static std::ifstream::pos_type getFileSize(const char* filename) {
+    std::ifstream in(filename, std::ifstream::ate | std::ifstream::binary);
+    return in.tellg();
+}
+
 static int handleCommandLineArguments(int argc, char* argv[], App* app) {
-    static constexpr const char* OPTSTR = "ha:i:usc:rt:";
+    static constexpr const char* OPTSTR = "ha:i:usc:rt:b:";
     static const struct option OPTIONS[] = {
         { "help",         no_argument,       nullptr, 'h' },
         { "api",          required_argument, nullptr, 'a' },
+        { "batch",        optional_argument, nullptr, 'b' },
         { "ibl",          required_argument, nullptr, 'i' },
         { "ubershader",   no_argument,       nullptr, 'u' },
         { "actual-size",  no_argument,       nullptr, 's' },
@@ -213,20 +245,35 @@ static int handleCommandLineArguments(int argc, char* argv[], App* app) {
             case 'r':
                 app->recomputeAabb = true;
                 break;
-            case 't':
+            case 'b':
                 if (arg.empty()) {
-                    arg = "settings.json";
+                    app->automation.batchTest = AutomationList::generateDefaultTestCases();
+                } else {
+                    auto size = getFileSize(arg.c_str());
+                    if (size > 0) {
+                        std::ifstream in(arg, std::ifstream::binary | std::ifstream::in);
+                        std::vector<char> json(static_cast<unsigned long>(size));
+                        in.read(json.data(), size);
+                        app->automation.batchTest = AutomationList::generate(json.data(), size);
+                        if (!app->automation.batchTest) {
+                            std::cerr << "Unable to parse automation spec." << std::endl;
+                        }
+                    } else {
+                        std::cerr << "Unable to load automation spec." << std::endl;
+                    }
                 }
-                app->settingsFile = arg;
+                if (app->automation.batchTest) {
+                    app->automation.sleepDuration = 0;
+                    app->automation.autostart = true;
+                    app->automation.autoclose = true;
+                }
+                break;
+            case 't':
+                app->settingsFile = arg.empty() ? "settings.json" : arg;
                 break;
         }
     }
     return optind;
-}
-
-static std::ifstream::pos_type getFileSize(const char* filename) {
-    std::ifstream in(filename, std::ifstream::ate | std::ifstream::binary);
-    return in.tellg();
 }
 
 static bool loadSettings(const char* filename, Settings* out) {
@@ -579,6 +626,84 @@ static LinearColor inverseTonemapSRGB(sRGBColor x) {
     return (x * -0.155) / (x - 1.019);
 }
 
+struct ScreenshotState {
+    View* view;
+    std::string filename;
+    bool autoclose;
+};
+
+// TODO: use ColorTransform.h
+template<typename T>
+static LinearImage toLinear(size_t w, size_t h, size_t bpr, const uint8_t* src) {
+    LinearImage result(w, h, 3);
+    filament::math::float3* d = reinterpret_cast<filament::math::float3*>(result.getPixelRef(0, 0));
+    for (size_t y = 0; y < h; ++y) {
+        T const* p = reinterpret_cast<T const*>(src + y * bpr);
+        for (size_t x = 0; x < w; ++x, p += 3) {
+            filament::math::float3 sRGB(p[0], p[1], p[2]);
+            sRGB /= std::numeric_limits<T>::max();
+            *d++ = sRGBToLinear(sRGB);
+        }
+    }
+    return result;
+}
+
+static std::string getAutomationPrefix(App* app) {
+    auto& automation = app->automation;
+    const int digits = (int) log10 ((double) automation.batchTest->size()) + 1;
+    std::ostringstream stringStream;
+    stringStream << "test"
+            << std::setfill('0') << std::setw(digits)
+            << std::to_string(automation.activeIndex) << "_"
+            << automation.batchTest->getName(automation.activeIndex);
+    return stringStream.str();
+}
+
+static void exportScreenshot(View* view, Renderer* renderer, std::string filename, bool autoclose) {
+    const Viewport& vp = view->getViewport();
+    const size_t byteCount = vp.width * vp.height * 3;
+
+    // Create a buffer descriptor that writes the PNG after the data becomes ready on the CPU.
+    backend::PixelBufferDescriptor buffer(
+        new uint8_t[byteCount], byteCount,
+        backend::PixelBufferDescriptor::PixelDataFormat::RGB,
+        backend::PixelBufferDescriptor::PixelDataType::UBYTE,
+        [](void* buffer, size_t size, void* user) {
+            ScreenshotState* state = static_cast<ScreenshotState*>(user);
+            const Viewport& vp = state->view->getViewport();
+            LinearImage image(toLinear<uint8_t>(vp.width, vp.height, vp.width * 3,
+                    static_cast<uint8_t*>(buffer)));
+            Path out(state->filename);
+            std::ofstream outputStream(out, std::ios::binary | std::ios::trunc);
+            ImageEncoder::encode(outputStream, ImageEncoder::Format::PNG, image, "",
+                    state->filename);
+            delete[] static_cast<uint8_t*>(buffer);
+            if (state->autoclose) {
+                FilamentApp::get().close();
+            }
+            delete state;
+        },
+        new ScreenshotState { view, filename, autoclose }
+    );
+
+    // Invoke readPixels asynchronously.
+    renderer->readPixels((uint32_t) vp.left, (uint32_t) vp.bottom, vp.width, vp.height,
+            std::move(buffer));
+}
+
+static std::string exportSettings(App* app, std::string filename) {
+    Settings settings = {
+        .view = app->viewer->getViewSettings()
+    };
+    std::string contents = writeJson(settings);
+    std::ofstream out(filename);
+    if (!out) {
+        return "Failed to export settings file.";
+    }
+    out << contents << std::endl;
+    return "Exported to '" + filename + "' in the current folder.";
+}
+
 int main(int argc, char** argv) {
     App app;
 
@@ -699,6 +824,52 @@ int main(int argc, char** argv) {
             float progress = app.resourceLoader->asyncGetLoadProgress();
             if (progress < 1.0) {
                 ImGui::ProgressBar(progress);
+            } else {
+                app.finishedLoading = true;
+            }
+
+            const int flags = app.automation.autoclose ? ImGuiTreeNodeFlags_DefaultOpen : 0;
+            if (ImGui::CollapsingHeader("Automation", flags)) {
+                auto& automation = app.automation;
+                if (!automation.batchTest) {
+                    automation.batchTest = AutomationList::generateDefaultTestCases();
+                }
+
+                ImGui::Indent();
+
+                const ImVec4 yellow(1.0f,1.0f,0.0f,1.0f);
+                if (automation.isActive) {
+                    ImGui::TextColored(yellow, "Test case %zu / %zu",
+                            automation.activeIndex, automation.batchTest->size());
+                } else {
+                    ImGui::TextColored(yellow, "%zu test cases", automation.batchTest->size());
+                }
+
+                ImGui::PushItemWidth(150);
+                ImGui::SliderFloat("Sleep (seconds)", &automation.sleepDuration, 0.0, 5.0);
+                ImGui::PopItemWidth();
+
+                // Hide the tooltip during automation to avoid photobombing the screenshot.
+                if (ImGui::IsItemHovered() && !automation.isActive) {
+                    ImGui::SetTooltip("Specifies the amount of time to sleep between test cases.");
+                }
+
+                ImGui::Checkbox("Export screenshot for each test", &automation.exportScreenshots);
+                ImGui::Checkbox("Export settings JSON for each test", &automation.exportSettings);
+
+                if (automation.isActive) {
+                    if (ImGui::Button("Stop batch test")) {
+                        automation.isActive = false;
+                    }
+                } else  if (ImGui::Button("Run batch test")) {
+                    startBatchTest(&app);
+                }
+
+                if (ImGui::Button("Export view settings")) {
+                    app.messageBoxText = exportSettings(&app, "settings.json");
+                    ImGui::OpenPopup("MessageBox");
+                }
+                ImGui::Unindent();
             }
 
             if (ImGui::CollapsingHeader("Stats")) {
@@ -888,6 +1059,50 @@ int main(int argc, char** argv) {
         }
     };
 
+    auto postRender = [&app](Engine* engine, View* view, Scene* scene, Renderer* renderer) {
+        auto& automation = app.automation;
+
+        if (!automation.isActive) {
+            if (app.finishedLoading && app.automation.autostart) {
+                startBatchTest(&app);
+                app.automation.autostart = false;
+            }
+            return;
+        }
+
+        // If we are still sleeping between tests, return early.
+        automation.elapsedTime += ImGui::GetIO().DeltaTime;
+        if (automation.elapsedTime < automation.sleepDuration) {
+            return;
+        }
+
+        const bool isLastTest = automation.activeIndex == automation.batchTest->size() - 1;
+
+        if (automation.exportScreenshots) {
+            exportScreenshot(view, renderer, getAutomationPrefix(&app) + ".png", isLastTest);
+        }
+
+        if (automation.exportSettings) {
+            exportSettings(&app, getAutomationPrefix(&app) + ".json");
+        }
+
+        if (isLastTest) {
+            automation.isActive = false;
+            if (automation.autoclose && !automation.exportScreenshots) {
+                FilamentApp::get().close();
+            }
+            return;
+        }
+
+        // Increment the case number and apply the next round of settings.
+        automation.elapsedTime = 0;
+        automation.activeIndex++;
+        Settings settings;
+        automation.batchTest->get(automation.activeIndex, &settings);
+        app.viewer->getViewSettings() = settings.view;
+        applySettings(settings.view, view);
+    };
+
     FilamentApp& filamentApp = FilamentApp::get();
     filamentApp.animate(animate);
     filamentApp.resize(resize);
@@ -899,7 +1114,7 @@ int main(int argc, char** argv) {
         loadResources(path);
     });
 
-    filamentApp.run(app.config, setup, cleanup, gui, preRender);
+    filamentApp.run(app.config, setup, cleanup, gui, preRender, postRender);
 
     return 0;
 }
